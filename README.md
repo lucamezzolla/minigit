@@ -1,8 +1,9 @@
 # MiniGit
 
-MiniGit is a tiny educational version control system written in C.
+MiniGit is a tiny educational content-addressed version control system written in C, primarily designed for Linux environments.
+The project was developed and tested on Linux using GCC and POSIX APIs.
 
-It is **not** a replacement for Git.  
+It is **not** a replacement for Git.
 The goal of this project is to learn how a version control system can be built from basic concepts:
 
 - command-line parsing
@@ -21,7 +22,7 @@ MiniGit currently supports:
 - adding files to an index
 - saving file contents as objects
 - creating commits
-- showing the status of tracked files
+- Git-like staged and unstaged change detection
 - viewing the commit log
 - showing a file from a previous commit
 - restoring a file from a previous commit
@@ -124,6 +125,16 @@ This command:
 3. stores the file content in `.minigit/objects/`
 4. updates `.minigit/index`
 
+MiniGit uses an index as a staging area.
+
+When you run:
+
+```bash
+./minigit add file.txt
+```
+
+the current version of the file is stored in the index and becomes staged for the next commit.
+
 ### Check status
 
 ```bash
@@ -133,9 +144,13 @@ This command:
 Possible output:
 
 ```text
-file.txt -> clean
-file.txt -> modified
-file.txt -> deleted or unreadable
+Changes staged for commit:
+  modified: file.txt
+
+Changes not staged for commit:
+  modified: file.txt
+
+Working tree clean.
 ```
 
 ### Create a commit
@@ -229,10 +244,24 @@ For example:
 file.txt -> 249889038256978411 -> .minigit/objects/249889038256978411.obj
 ```
 
-A commit does not store the full file directly.  
+A commit does not store the full file directly.
 It stores the filename and the hash of the object representing that version.
 
 This makes it possible to retrieve older versions later.
+
+MiniGit internally manages three states:
+
+```text
+Working Tree
+Index (staging area)
+HEAD (latest commit)
+```
+
+The `status` command compares these states to detect:
+
+- staged changes
+- unstaged changes
+- clean working trees
 
 ## Important Limitations
 
@@ -250,15 +279,16 @@ It does **not** currently support:
 - push / pull
 - deleting tracked files from commits
 - full project checkout
+- partial staging
 
 ## Educational Notes
 
 The hash function used in this project is based on `djb2`.
 
-It is useful for learning, but it is not secure.  
+It is useful for learning, but it is not secure.
 Real Git historically used SHA-1 and also supports SHA-256 in newer repositories.
 
 ## License
 
-This project is released for educational purposes.  
+This project is released for educational purposes.
 You can use, modify, and share it freely.

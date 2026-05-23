@@ -26,6 +26,7 @@
 #define COMMITS_DIR ".minigit/commits"
 #define INDEX_FILE ".minigit/index"
 #define HEAD_FILE ".minigit/HEAD"
+#define TEMP_INDEX_FILE ".minigit/index.tmp"
 
 #define MAX_PATH_LEN 512
 #define MAX_LINE_LEN 1024
@@ -37,31 +38,71 @@ typedef enum {
     INDEX_UPDATED = 2
 } IndexResult;
 
-static int create_directory_if_missing(const char *path);
+/* CLI / repository lifecycle */
+static void print_usage(void);
 static int require_repository(void);
+static int create_directory_if_missing(const char *path);
 static int init_repository(void);
 
+/* File hashing and object storage */
 static unsigned long calculate_file_hash(const char *filename);
 static int copy_file(const char *source_path, const char *destination_path);
 static int save_file_object(const char *filename, unsigned long hash);
 
+/* Index / staging area */
 static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash);
 static int add_file(const char *filename);
-static void show_status(void);
 
+/* Commit handling */
 static int get_current_head(void);
 static int get_next_commit_id(void);
 static int update_head(int commit_id);
+static int find_file_hash_in_commit(int commit_id, const char *filename, unsigned long *found_hash);
+static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash);
+static int index_matches_commit(int commit_id);
 static int create_commit(const char *message);
 static void show_log(void);
 
-static int find_file_hash_in_commit(int commit_id, const char *filename, unsigned long *found_hash);
+/* Status */
+static void show_working_tree_changes(int *changes_count);
+static void show_staged_changes(int *staged_count);
+static void show_status(void);
+
+/* Read / restore old versions */
 static void show_file_from_commit(int commit_id, const char *filename);
 static int restore_file_from_commit(int commit_id, const char *filename);
 
-static void print_usage(void);
-static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash);
-static int index_matches_commit(int commit_id);
+/* CLI / repository lifecycle */
+
+static void print_usage(void) {
+    printf("MiniGit - educational version control in C\n\n");
+    printf("Usage:\n");
+    printf("  ./minigit init\n");
+    printf("  ./minigit add <file>\n");
+    printf("  ./minigit status\n");
+    printf("  ./minigit commit <message>\n");
+    printf("  ./minigit log\n");
+    printf("  ./minigit show <commit_id> <file>\n");
+    printf("  ./minigit restore <commit_id> <file>\n\n");
+    printf("Examples:\n");
+    printf("  ./minigit init\n");
+    printf("  ./minigit add main.c\n");
+    printf("  ./minigit commit \"Initial commit\"\n");
+    printf("  ./minigit show 1 main.c\n");
+    printf("  ./minigit restore 1 main.c\n");
+}
+
+static int require_repository(void) {
+    if (access(MINIGIT_DIR, F_OK) != 0 ||
+        access(OBJECTS_DIR, F_OK) != 0 ||
+        access(COMMITS_DIR, F_OK) != 0 ||
+        access(HEAD_FILE, F_OK) != 0) {
+        fprintf(stderr, "Error: not a MiniGit repository. Run './minigit init' first.\n");
+        return 0;
+    }
+
+    return 1;
+}
 
 static int create_directory_if_missing(const char *path) {
     if (mkdir(path, 0700) == 0) {
@@ -73,19 +114,6 @@ static int create_directory_if_missing(const char *path) {
     }
 
     return 0;
-}
-
-static int require_repository(void) {
-    if (access(MINIGIT_DIR, F_OK) != 0 ||
-        access(OBJECTS_DIR, F_OK) != 0 ||
-        access(COMMITS_DIR, F_OK) != 0 ||
-        access(HEAD_FILE, F_OK) != 0) {
-
-        fprintf(stderr, "Error: not a MiniGit repository. Run './minigit init' first.\n");
-        return 0;
-    }
-
-    return 1;
 }
 
 static int init_repository(void) {
@@ -114,6 +142,8 @@ static int init_repository(void) {
     printf("Initialized empty MiniGit repository in %s/\n", MINIGIT_DIR);
     return 1;
 }
+
+/* File hashing and object storage */
 
 /*
  * Educational hash function based on djb2.
@@ -182,9 +212,11 @@ static int save_file_object(const char *filename, unsigned long hash) {
     return copy_file(filename, object_path);
 }
 
+/* Index / staging area */
+
 static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash) {
     FILE *index = fopen(INDEX_FILE, "r");
-    FILE *temporary_index = fopen(".minigit/index.tmp", "w");
+    FILE *temporary_index = fopen(TEMP_INDEX_FILE, "w");
 
     if (temporary_index == NULL) {
         fprintf(stderr, "Error: failed to create temporary index file.\n");
@@ -219,7 +251,7 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
 
     fclose(temporary_index);
 
-    if (rename(".minigit/index.tmp", INDEX_FILE) != 0) {
+    if (rename(TEMP_INDEX_FILE, INDEX_FILE) != 0) {
         fprintf(stderr, "Error: failed to update index file.\n");
         return INDEX_ERROR;
     }
@@ -228,7 +260,6 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
 }
 
 static int add_file(const char *filename) {
-
     if (access(filename, F_OK) != 0) {
         fprintf(stderr, "Error: file '%s' does not exist.\n", filename);
         return 0;
@@ -261,31 +292,7 @@ static int add_file(const char *filename) {
     return 1;
 }
 
-static void show_status(void) {
-    FILE *index = fopen(INDEX_FILE, "r");
-
-    if (index == NULL) {
-        printf("No files in the index.\n");
-        return;
-    }
-
-    char filename[MAX_FILENAME_LEN];
-    unsigned long saved_hash;
-
-    while (fscanf(index, "%255s %lu", filename, &saved_hash) == 2) {
-        unsigned long current_hash = calculate_file_hash(filename);
-
-        if (current_hash == 0) {
-            printf("%s -> deleted or unreadable\n", filename);
-        } else if (current_hash == saved_hash) {
-            printf("%s -> clean\n", filename);
-        } else {
-            printf("%s -> modified\n", filename);
-        }
-    }
-
-    fclose(index);
-}
+/* Commit handling */
 
 static int get_current_head(void) {
     FILE *head = fopen(HEAD_FILE, "r");
@@ -328,18 +335,107 @@ static int update_head(int commit_id) {
     return 1;
 }
 
+static int find_file_hash_in_commit(int commit_id, const char *filename, unsigned long *found_hash) {
+    char commit_path[MAX_PATH_LEN];
+
+    if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
+        return 0;
+    }
+
+    FILE *commit = fopen(commit_path, "r");
+
+    if (commit == NULL) {
+        return 0;
+    }
+
+    char line[MAX_LINE_LEN];
+
+    while (fgets(line, sizeof(line), commit) != NULL) {
+        char indexed_filename[MAX_FILENAME_LEN];
+        unsigned long hash;
+
+        if (sscanf(line, "- %255s %lu", indexed_filename, &hash) == 2) {
+            if (strcmp(indexed_filename, filename) == 0) {
+                *found_hash = hash;
+                fclose(commit);
+                return 1;
+            }
+        }
+    }
+
+    fclose(commit);
+    return 0;
+}
+
+static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash) {
+    char line[MAX_LINE_LEN];
+
+    rewind(snapshot);
+
+    while (fgets(line, sizeof(line), snapshot) != NULL) {
+        char snapshot_filename[MAX_FILENAME_LEN];
+        unsigned long snapshot_hash;
+
+        if (sscanf(line, "- %255s %lu", snapshot_filename, &snapshot_hash) == 2 ||
+            sscanf(line, "%255s %lu", snapshot_filename, &snapshot_hash) == 2) {
+
+            if (strcmp(snapshot_filename, filename) == 0 && snapshot_hash == expected_hash) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int index_matches_commit(int commit_id) {
+    char commit_path[MAX_PATH_LEN];
+
+    if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
+        return 0;
+    }
+
+    FILE *index = fopen(INDEX_FILE, "r");
+    FILE *commit = fopen(commit_path, "r");
+
+    if (index == NULL || commit == NULL) {
+        if (index != NULL) fclose(index);
+        if (commit != NULL) fclose(commit);
+        return 0;
+    }
+
+    char filename[MAX_FILENAME_LEN];
+    unsigned long hash;
+    int entries = 0;
+
+    while (fscanf(index, "%255s %lu", filename, &hash) == 2) {
+        if (!snapshot_contains_file_hash(commit, filename, hash)) {
+            fclose(index);
+            fclose(commit);
+            return 0;
+        }
+
+        entries++;
+    }
+
+    fclose(index);
+    fclose(commit);
+
+    return entries > 0;
+}
+
 static int create_commit(const char *message) {
     if (access(INDEX_FILE, F_OK) != 0) {
         fprintf(stderr, "Error: no index found. Add files before committing.\n");
         return 0;
     }
-    
+
     int current_head = get_current_head();
 
-	if (current_head > 0 && index_matches_commit(current_head)) {
-    	printf("Nothing to commit.\n");
-    	return 1;
-	}
+    if (current_head > 0 && index_matches_commit(current_head)) {
+        printf("Nothing to commit.\n");
+        return 1;
+    }
 
     int commit_id = get_next_commit_id();
 
@@ -439,37 +535,90 @@ static void show_log(void) {
     }
 }
 
-static int find_file_hash_in_commit(int commit_id, const char *filename, unsigned long *found_hash) {
-    char commit_path[MAX_PATH_LEN];
+/* Status */
 
-    if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
-        return 0;
+static void show_working_tree_changes(int *changes_count) {
+    FILE *index = fopen(INDEX_FILE, "r");
+
+    if (index == NULL) {
+        printf("No files in the index.\n");
+        return;
     }
 
-    FILE *commit = fopen(commit_path, "r");
+    char filename[MAX_FILENAME_LEN];
+    unsigned long index_hash;
 
-    if (commit == NULL) {
-        return 0;
-    }
+    while (fscanf(index, "%255s %lu", filename, &index_hash) == 2) {
+        unsigned long working_tree_hash = calculate_file_hash(filename);
 
-    char line[MAX_LINE_LEN];
-
-    while (fgets(line, sizeof(line), commit) != NULL) {
-        char indexed_filename[MAX_FILENAME_LEN];
-        unsigned long hash;
-
-        if (sscanf(line, "- %255s %lu", indexed_filename, &hash) == 2) {
-            if (strcmp(indexed_filename, filename) == 0) {
-                *found_hash = hash;
-                fclose(commit);
-                return 1;
+        if (working_tree_hash == 0) {
+            if (*changes_count == 0) {
+                printf("Changes not staged for commit:\n");
             }
+
+            printf("  deleted: %s\n", filename);
+            (*changes_count)++;
+        } else if (working_tree_hash != index_hash) {
+            if (*changes_count == 0) {
+                printf("Changes not staged for commit:\n");
+            }
+
+            printf("  modified: %s\n", filename);
+            (*changes_count)++;
         }
     }
 
-    fclose(commit);
-    return 0;
+    fclose(index);
 }
+
+static void show_staged_changes(int *staged_count) {
+    int current_head = get_current_head();
+
+    FILE *index = fopen(INDEX_FILE, "r");
+
+    if (index == NULL) {
+        return;
+    }
+
+    char filename[MAX_FILENAME_LEN];
+    unsigned long index_hash;
+
+    while (fscanf(index, "%255s %lu", filename, &index_hash) == 2) {
+        unsigned long commit_hash;
+
+        if (current_head <= 0 || !find_file_hash_in_commit(current_head, filename, &commit_hash)) {
+            if (*staged_count == 0) {
+                printf("Changes staged for commit:\n");
+            }
+
+            printf("  new file: %s\n", filename);
+            (*staged_count)++;
+        } else if (index_hash != commit_hash) {
+            if (*staged_count == 0) {
+                printf("Changes staged for commit:\n");
+            }
+
+            printf("  modified: %s\n", filename);
+            (*staged_count)++;
+        }
+    }
+
+    fclose(index);
+}
+
+static void show_status(void) {
+    int staged_count = 0;
+    int changes_count = 0;
+
+    show_staged_changes(&staged_count);
+    show_working_tree_changes(&changes_count);
+
+    if (staged_count == 0 && changes_count == 0) {
+        printf("Working tree clean.\n");
+    }
+}
+
+/* Read / restore old versions */
 
 static void show_file_from_commit(int commit_id, const char *filename) {
     unsigned long hash;
@@ -526,87 +675,14 @@ static int restore_file_from_commit(int commit_id, const char *filename) {
     return 1;
 }
 
-static void print_usage(void) {
-    printf("MiniGit - educational version control in C\n\n");
-    printf("Usage:\n");
-    printf("  ./minigit init\n");
-    printf("  ./minigit add <file>\n");
-    printf("  ./minigit status\n");
-    printf("  ./minigit commit <message>\n");
-    printf("  ./minigit log\n");
-    printf("  ./minigit show <commit_id> <file>\n");
-    printf("  ./minigit restore <commit_id> <file>\n\n");
-    printf("Examples:\n");
-    printf("  ./minigit init\n");
-    printf("  ./minigit add main.c\n");
-    printf("  ./minigit commit \"Initial commit\"\n");
-    printf("  ./minigit show 1 main.c\n");
-    printf("  ./minigit restore 1 main.c\n");
-}
-
-static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash) {
-    char line[MAX_LINE_LEN];
-
-    rewind(snapshot);
-
-    while (fgets(line, sizeof(line), snapshot) != NULL) {
-        char snapshot_filename[MAX_FILENAME_LEN];
-        unsigned long snapshot_hash;
-
-        if (sscanf(line, "- %255s %lu", snapshot_filename, &snapshot_hash) == 2 ||
-            sscanf(line, "%255s %lu", snapshot_filename, &snapshot_hash) == 2) {
-
-            if (strcmp(snapshot_filename, filename) == 0 && snapshot_hash == expected_hash) {
-                return 1;
-            }
-        }
-    }
-
-    return 0;
-}
-
-static int index_matches_commit(int commit_id) {
-    char commit_path[MAX_PATH_LEN];
-
-    if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
-        return 0;
-    }
-
-    FILE *index = fopen(INDEX_FILE, "r");
-    FILE *commit = fopen(commit_path, "r");
-
-    if (index == NULL || commit == NULL) {
-        if (index != NULL) fclose(index);
-        if (commit != NULL) fclose(commit);
-        return 0;
-    }
-
-    char filename[MAX_FILENAME_LEN];
-    unsigned long hash;
-    int entries = 0;
-
-    while (fscanf(index, "%255s %lu", filename, &hash) == 2) {
-        if (!snapshot_contains_file_hash(commit, filename, hash)) {
-            fclose(index);
-            fclose(commit);
-            return 0;
-        }
-
-        entries++;
-    }
-
-    fclose(index);
-    fclose(commit);
-
-    return entries > 0;
-}
+/* Main command dispatcher */
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         print_usage();
         return EXIT_FAILURE;
     }
-    
+
     if (strcmp(argv[1], "init") != 0) {
         if (!require_repository()) {
             return EXIT_FAILURE;
