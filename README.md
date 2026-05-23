@@ -25,6 +25,8 @@ MiniGit currently supports:
 - viewing the commit log
 - showing a file from a previous commit
 - restoring a file from a previous commit
+- repository validation before command execution
+- prevention of empty commits when no changes are staged
 
 ## Repository Structure
 
@@ -143,6 +145,12 @@ file.txt -> deleted or unreadable
 ```
 
 This creates a new file inside `.minigit/commits/`.
+
+If the index already matches the latest commit, MiniGit prints:
+
+```text
+Nothing to commit.
+```
 
 ### Show the commit log
 
