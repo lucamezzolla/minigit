@@ -43,70 +43,47 @@ typedef enum {
     INDEX_UPDATED = 2
 } IndexResult;
 
-/* --------------------------------------------------------------------------
- * CLI / repository lifecycle
- * -------------------------------------------------------------------------- */
-
+/* CLI / repository lifecycle */
 static void print_usage(void);
 static int require_repository(void);
 static int create_directory_if_missing(const char *path);
 static int init_repository(void);
 
-/* --------------------------------------------------------------------------
- * File hashing and object storage
- * -------------------------------------------------------------------------- */
-
+/* File hashing and object storage */
 static unsigned long calculate_file_hash(const char *filename);
 static int copy_file(const char *source_path, const char *destination_path);
 static int save_file_object(const char *filename, unsigned long hash);
 
-/* --------------------------------------------------------------------------
- * Index / staging area
- * -------------------------------------------------------------------------- */
-
+/* Index / staging area */
 static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash);
-static int remove_index_entry(const char *filename);
+static int stage_delete_index_entry(const char *filename);
 static int add_file(const char *filename);
 static int rm_file(const char *filename);
 
-/* --------------------------------------------------------------------------
- * Commit handling
- * -------------------------------------------------------------------------- */
-
+/* Commit handling */
 static int get_current_head(void);
 static int get_next_commit_id(void);
 static int update_head(int commit_id);
 static int find_file_hash_in_commit(int commit_id, const char *filename, unsigned long *found_hash);
-static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash);
+static int commit_contains_delete(int commit_id, const char *filename);
 static int index_matches_commit(int commit_id);
 static int create_commit(const char *message);
 static void show_log(void);
 
-/* --------------------------------------------------------------------------
- * Status
- * -------------------------------------------------------------------------- */
-
+/* Status */
 static void show_working_tree_changes(int *changes_count);
 static void show_staged_changes(int *staged_count);
 static void show_status(void);
 
-/* --------------------------------------------------------------------------
- * Read / restore / checkout old versions
- * -------------------------------------------------------------------------- */
-
+/* Read / restore / checkout old versions */
 static void show_file_from_commit(int commit_id, const char *filename);
 static int restore_file_from_commit(int commit_id, const char *filename);
 static int checkout_commit(int commit_id);
 
-/* --------------------------------------------------------------------------
- * Diff
- * -------------------------------------------------------------------------- */
-
+/* Diff */
 static void diff_file(const char *filename);
 
-/* --------------------------------------------------------------------------
- * CLI / repository lifecycle implementation
- * -------------------------------------------------------------------------- */
+/* CLI / repository lifecycle */
 
 static void print_usage(void) {
     printf("MiniGit - educational version control in C\n\n");
@@ -184,9 +161,7 @@ static int init_repository(void) {
     return 1;
 }
 
-/* --------------------------------------------------------------------------
- * File hashing and object storage implementation
- * -------------------------------------------------------------------------- */
+/* File hashing and object storage */
 
 /*
  * Educational hash function based on djb2.
@@ -255,9 +230,7 @@ static int save_file_object(const char *filename, unsigned long hash) {
     return copy_file(filename, object_path);
 }
 
-/* --------------------------------------------------------------------------
- * Index / staging area implementation
- * -------------------------------------------------------------------------- */
+/* Index / staging area */
 
 static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash) {
     FILE *index = fopen(INDEX_FILE, "r");
@@ -274,16 +247,34 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
     }
 
     int found = 0;
-    char indexed_filename[MAX_FILENAME_LEN];
-    unsigned long indexed_hash;
+    char line[MAX_LINE_LEN];
 
     if (index != NULL) {
-        while (fscanf(index, "%255s %lu", indexed_filename, &indexed_hash) == 2) {
-            if (strcmp(indexed_filename, filename) == 0) {
-                fprintf(temporary_index, "%s %lu\n", filename, new_hash);
-                found = 1;
-            } else {
-                fprintf(temporary_index, "%s %lu\n", indexed_filename, indexed_hash);
+        while (fgets(line, sizeof(line), index) != NULL) {
+            char indexed_filename[MAX_FILENAME_LEN];
+            unsigned long indexed_hash;
+
+            if (strncmp(line, "DELETE ", 7) == 0) {
+                char deleted_filename[MAX_FILENAME_LEN];
+
+                if (sscanf(line, "DELETE %255s", deleted_filename) == 1 &&
+                    strcmp(deleted_filename, filename) == 0) {
+                    fprintf(temporary_index, "%s %lu\n", filename, new_hash);
+                    found = 1;
+                } else {
+                    fputs(line, temporary_index);
+                }
+
+                continue;
+            }
+
+            if (sscanf(line, "%255s %lu", indexed_filename, &indexed_hash) == 2) {
+                if (strcmp(indexed_filename, filename) == 0) {
+                    fprintf(temporary_index, "%s %lu\n", filename, new_hash);
+                    found = 1;
+                } else {
+                    fprintf(temporary_index, "%s %lu\n", indexed_filename, indexed_hash);
+                }
             }
         }
 
@@ -304,41 +295,69 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
     return found ? INDEX_UPDATED : INDEX_ADDED;
 }
 
-static int remove_index_entry(const char *filename) {
+static int stage_delete_index_entry(const char *filename) {
     FILE *index = fopen(INDEX_FILE, "r");
-
-    if (index == NULL) {
-        return 0;
-    }
-
     FILE *temporary_index = fopen(TEMP_INDEX_FILE, "w");
 
     if (temporary_index == NULL) {
-        fclose(index);
+        if (index != NULL) {
+            fclose(index);
+        }
+
+        fprintf(stderr, "Error: failed to create temporary index file.\n");
         return 0;
     }
 
-    char indexed_filename[MAX_FILENAME_LEN];
-    unsigned long hash;
-    int removed = 0;
+    int tracked = 0;
+    int already_deleted = 0;
+    char line[MAX_LINE_LEN];
 
-    while (fscanf(index, "%255s %lu", indexed_filename, &hash) == 2) {
-        if (strcmp(indexed_filename, filename) == 0) {
-            removed = 1;
-        } else {
-            fprintf(temporary_index, "%s %lu\n", indexed_filename, hash);
+    if (index != NULL) {
+        while (fgets(line, sizeof(line), index) != NULL) {
+            char indexed_filename[MAX_FILENAME_LEN];
+            unsigned long hash;
+
+            if (strncmp(line, "DELETE ", 7) == 0) {
+                char deleted_filename[MAX_FILENAME_LEN];
+
+                if (sscanf(line, "DELETE %255s", deleted_filename) == 1 &&
+                    strcmp(deleted_filename, filename) == 0) {
+                    already_deleted = 1;
+                    tracked = 1;
+                    fputs(line, temporary_index);
+                } else {
+                    fputs(line, temporary_index);
+                }
+
+                continue;
+            }
+
+            if (sscanf(line, "%255s %lu", indexed_filename, &hash) == 2) {
+                if (strcmp(indexed_filename, filename) == 0) {
+                    tracked = 1;
+                    fprintf(temporary_index, "DELETE %s\n", filename);
+                } else {
+                    fprintf(temporary_index, "%s %lu\n", indexed_filename, hash);
+                }
+            }
         }
+
+        fclose(index);
     }
 
-    fclose(index);
     fclose(temporary_index);
+
+    if (!tracked && !already_deleted) {
+        remove(TEMP_INDEX_FILE);
+        return 0;
+    }
 
     if (rename(TEMP_INDEX_FILE, INDEX_FILE) != 0) {
         fprintf(stderr, "Error: failed to update index file.\n");
         return 0;
     }
 
-    return removed;
+    return 1;
 }
 
 static int add_file(const char *filename) {
@@ -375,7 +394,7 @@ static int add_file(const char *filename) {
 }
 
 static int rm_file(const char *filename) {
-    if (!remove_index_entry(filename)) {
+    if (!stage_delete_index_entry(filename)) {
         fprintf(stderr, "Error: file '%s' is not tracked.\n", filename);
         return 0;
     }
@@ -387,13 +406,11 @@ static int rm_file(const char *filename) {
         }
     }
 
-    printf("Removed '%s'.\n", filename);
+    printf("Staged deletion of '%s'.\n", filename);
     return 1;
 }
 
-/* --------------------------------------------------------------------------
- * Commit handling implementation
- * -------------------------------------------------------------------------- */
+/* Commit handling */
 
 static int get_current_head(void) {
     FILE *head = fopen(HEAD_FILE, "r");
@@ -468,59 +485,78 @@ static int find_file_hash_in_commit(int commit_id, const char *filename, unsigne
     return 0;
 }
 
-static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash) {
-    char line[MAX_LINE_LEN];
-
-    rewind(snapshot);
-
-    while (fgets(line, sizeof(line), snapshot) != NULL) {
-        char snapshot_filename[MAX_FILENAME_LEN];
-        unsigned long snapshot_hash;
-
-        if (sscanf(line, "- %255s %lu", snapshot_filename, &snapshot_hash) == 2 ||
-            sscanf(line, "%255s %lu", snapshot_filename, &snapshot_hash) == 2) {
-            if (strcmp(snapshot_filename, filename) == 0 && snapshot_hash == expected_hash) {
-                return 1;
-            }
-        }
-    }
-
-    return 0;
-}
-
-static int index_matches_commit(int commit_id) {
+static int commit_contains_delete(int commit_id, const char *filename) {
     char commit_path[MAX_PATH_LEN];
 
     if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
         return 0;
     }
 
-    FILE *index = fopen(INDEX_FILE, "r");
     FILE *commit = fopen(commit_path, "r");
 
-    if (index == NULL || commit == NULL) {
-        if (index != NULL) fclose(index);
-        if (commit != NULL) fclose(commit);
+    if (commit == NULL) {
         return 0;
     }
 
-    char filename[MAX_FILENAME_LEN];
-    unsigned long hash;
+    char line[MAX_LINE_LEN];
+
+    while (fgets(line, sizeof(line), commit) != NULL) {
+        char deleted_filename[MAX_FILENAME_LEN];
+
+        if (sscanf(line, "DELETE %255s", deleted_filename) == 1) {
+            if (strcmp(deleted_filename, filename) == 0) {
+                fclose(commit);
+                return 1;
+            }
+        }
+    }
+
+    fclose(commit);
+    return 0;
+}
+
+static int index_matches_commit(int commit_id) {
+    FILE *index = fopen(INDEX_FILE, "r");
+
+    if (index == NULL) {
+        return 0;
+    }
+
+    char line[MAX_LINE_LEN];
     int entries = 0;
 
-    while (fscanf(index, "%255s %lu", filename, &hash) == 2) {
-        if (!snapshot_contains_file_hash(commit, filename, hash)) {
-            fclose(index);
-            fclose(commit);
-            return 0;
+    while (fgets(line, sizeof(line), index) != NULL) {
+        char filename[MAX_FILENAME_LEN];
+        unsigned long index_hash;
+
+        if (sscanf(line, "DELETE %255s", filename) == 1) {
+            if (!commit_contains_delete(commit_id, filename)) {
+                fclose(index);
+                return 0;
+            }
+
+            entries++;
+            continue;
         }
 
-        entries++;
+        if (sscanf(line, "%255s %lu", filename, &index_hash) == 2) {
+            unsigned long commit_hash;
+
+            if (!find_file_hash_in_commit(commit_id, filename, &commit_hash)) {
+                fclose(index);
+                return 0;
+            }
+
+            if (index_hash != commit_hash) {
+                fclose(index);
+                return 0;
+            }
+
+            entries++;
+        }
     }
 
     fclose(index);
-    fclose(commit);
-
     return entries > 0;
 }
 
@@ -570,13 +606,23 @@ static int create_commit(const char *message) {
         return 0;
     }
 
-    char filename[MAX_FILENAME_LEN];
-    unsigned long hash;
+    char line[MAX_LINE_LEN];
     int file_count = 0;
 
-    while (fscanf(index, "%255s %lu", filename, &hash) == 2) {
-        fprintf(commit, "- %s %lu\n", filename, hash);
-        file_count++;
+    while (fgets(line, sizeof(line), index) != NULL) {
+        char filename[MAX_FILENAME_LEN];
+        unsigned long hash;
+
+        if (sscanf(line, "DELETE %255s", filename) == 1) {
+            fprintf(commit, "DELETE %s\n", filename);
+            file_count++;
+            continue;
+        }
+
+        if (sscanf(line, "%255s %lu", filename, &hash) == 2) {
+            fprintf(commit, "- %s %lu\n", filename, hash);
+            file_count++;
+        }
     }
 
     fclose(index);
@@ -635,9 +681,7 @@ static void show_log(void) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * Status implementation
- * -------------------------------------------------------------------------- */
+/* Status */
 
 static void show_working_tree_changes(int *changes_count) {
     FILE *index = fopen(INDEX_FILE, "r");
@@ -647,10 +691,20 @@ static void show_working_tree_changes(int *changes_count) {
         return;
     }
 
-    char filename[MAX_FILENAME_LEN];
-    unsigned long index_hash;
+    char line[MAX_LINE_LEN];
 
-    while (fscanf(index, "%255s %lu", filename, &index_hash) == 2) {
+    while (fgets(line, sizeof(line), index) != NULL) {
+        char filename[MAX_FILENAME_LEN];
+        unsigned long index_hash;
+
+        if (sscanf(line, "DELETE %255s", filename) == 1) {
+            continue;
+        }
+
+        if (sscanf(line, "%255s %lu", filename, &index_hash) != 2) {
+            continue;
+        }
+
         unsigned long working_tree_hash = calculate_file_hash(filename);
 
         if (working_tree_hash == 0) {
@@ -682,10 +736,26 @@ static void show_staged_changes(int *staged_count) {
         return;
     }
 
-    char filename[MAX_FILENAME_LEN];
-    unsigned long index_hash;
+    char line[MAX_LINE_LEN];
 
-    while (fscanf(index, "%255s %lu", filename, &index_hash) == 2) {
+    while (fgets(line, sizeof(line), index) != NULL) {
+        char filename[MAX_FILENAME_LEN];
+        unsigned long index_hash;
+
+        if (sscanf(line, "DELETE %255s", filename) == 1) {
+            if (*staged_count == 0) {
+                printf("Changes staged for commit:\n");
+            }
+
+            printf("  deleted: %s\n", filename);
+            (*staged_count)++;
+            continue;
+        }
+
+        if (sscanf(line, "%255s %lu", filename, &index_hash) != 2) {
+            continue;
+        }
+
         unsigned long commit_hash;
 
         if (current_head <= 0 || !find_file_hash_in_commit(current_head, filename, &commit_hash)) {
@@ -720,9 +790,7 @@ static void show_status(void) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * Read / restore / checkout old versions implementation
- * -------------------------------------------------------------------------- */
+/* Read / restore / checkout old versions */
 
 static void show_file_from_commit(int commit_id, const char *filename) {
     unsigned long hash;
@@ -800,6 +868,15 @@ static int checkout_commit(int commit_id) {
         char filename[MAX_FILENAME_LEN];
         unsigned long hash;
 
+        if (sscanf(line, "DELETE %255s", filename) == 1) {
+            if (access(filename, F_OK) == 0) {
+                remove(filename);
+            }
+
+            stage_delete_index_entry(filename);
+            continue;
+        }
+
         if (sscanf(line, "- %255s %lu", filename, &hash) == 2) {
             char object_path[MAX_PATH_LEN];
 
@@ -830,9 +907,7 @@ static int checkout_commit(int commit_id) {
     return 1;
 }
 
-/* --------------------------------------------------------------------------
- * Diff implementation
- * -------------------------------------------------------------------------- */
+/* Diff */
 
 static void diff_file(const char *filename) {
     FILE *index = fopen(INDEX_FILE, "r");
@@ -842,14 +917,31 @@ static void diff_file(const char *filename) {
         return;
     }
 
-    char indexed_filename[MAX_FILENAME_LEN];
-    unsigned long index_hash;
+    char line[MAX_LINE_LEN];
+    unsigned long index_hash = 0;
     int found = 0;
+    int staged_delete = 0;
 
-    while (fscanf(index, "%255s %lu", indexed_filename, &index_hash) == 2) {
-        if (strcmp(indexed_filename, filename) == 0) {
-            found = 1;
-            break;
+    while (fgets(line, sizeof(line), index) != NULL) {
+        char indexed_filename[MAX_FILENAME_LEN];
+        unsigned long hash;
+
+        if (sscanf(line, "DELETE %255s", indexed_filename) == 1) {
+            if (strcmp(indexed_filename, filename) == 0) {
+                staged_delete = 1;
+                found = 1;
+                break;
+            }
+
+            continue;
+        }
+
+        if (sscanf(line, "%255s %lu", indexed_filename, &hash) == 2) {
+            if (strcmp(indexed_filename, filename) == 0) {
+                index_hash = hash;
+                found = 1;
+                break;
+            }
         }
     }
 
@@ -857,6 +949,11 @@ static void diff_file(const char *filename) {
 
     if (!found) {
         fprintf(stderr, "Error: file '%s' is not staged.\n", filename);
+        return;
+    }
+
+    if (staged_delete) {
+        printf("File '%s' is staged for deletion.\n", filename);
         return;
     }
 
@@ -914,9 +1011,7 @@ static void diff_file(const char *filename) {
     }
 }
 
-/* --------------------------------------------------------------------------
- * Main command dispatcher
- * -------------------------------------------------------------------------- */
+/* Main command dispatcher */
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
