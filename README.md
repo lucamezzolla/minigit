@@ -1,9 +1,10 @@
 # MiniGit
 
 MiniGit is a tiny educational content-addressed version control system written in C, primarily designed for Linux environments.
+
 The project was developed and tested on Linux using GCC and POSIX APIs.
 
-It is **not** a replacement for Git.
+It is **not** a replacement for Git.  
 The goal of this project is to learn how a version control system can be built from basic concepts:
 
 - command-line parsing
@@ -11,21 +12,28 @@ The goal of this project is to learn how a version control system can be built f
 - directory management
 - content hashing
 - object storage
+- staging area
 - commit metadata
+- status inspection
 - restoring older file versions
+- checking out snapshots
+- simple line-by-line diff
 
 ## Features
 
 MiniGit currently supports:
 
 - initializing a local repository
-- adding files to an index
+- adding files to an index/staging area
+- removing tracked files
 - saving file contents as objects
 - creating commits
 - Git-like staged and unstaged change detection
 - viewing the commit log
 - showing a file from a previous commit
-- restoring a file from a previous commit
+- restoring a single file from a previous commit
+- checking out a full commit snapshot
+- simple line-by-line diff between the index and the working tree
 - repository validation before command execution
 - prevention of empty commits when no changes are staged
 
@@ -34,7 +42,7 @@ MiniGit currently supports:
 After running:
 
 ```bash
-./minigit init
+minigit init
 ```
 
 MiniGit creates:
@@ -104,18 +112,30 @@ Compile with GCC:
 gcc -Wall -Wextra -pedantic -std=c11 minigit.c -o minigit
 ```
 
+Optional system-wide installation on Linux:
+
+```bash
+sudo cp minigit /usr/local/bin/
+```
+
+After that, you can run MiniGit from any directory:
+
+```bash
+minigit status
+```
+
 ## Usage
 
 ### Initialize a repository
 
 ```bash
-./minigit init
+minigit init
 ```
 
 ### Add a file
 
 ```bash
-./minigit add file.txt
+minigit add file.txt
 ```
 
 This command:
@@ -125,20 +145,28 @@ This command:
 3. stores the file content in `.minigit/objects/`
 4. updates `.minigit/index`
 
-MiniGit uses an index as a staging area.
+MiniGit uses the index as a staging area.
 
 When you run:
 
 ```bash
-./minigit add file.txt
+minigit add file.txt
 ```
 
 the current version of the file is stored in the index and becomes staged for the next commit.
 
+### Remove a tracked file
+
+```bash
+minigit rm file.txt
+```
+
+This command removes the file from the working tree and removes it from the index.
+
 ### Check status
 
 ```bash
-./minigit status
+minigit status
 ```
 
 Possible output:
@@ -153,10 +181,20 @@ Changes not staged for commit:
 Working tree clean.
 ```
 
+The status command compares:
+
+```text
+Working Tree
+Index
+HEAD
+```
+
+This allows MiniGit to detect staged changes, unstaged changes, deleted files, and clean working trees.
+
 ### Create a commit
 
 ```bash
-./minigit commit "Initial commit"
+minigit commit "Initial commit"
 ```
 
 This creates a new file inside `.minigit/commits/`.
@@ -170,7 +208,7 @@ Nothing to commit.
 ### Show the commit log
 
 ```bash
-./minigit log
+minigit log
 ```
 
 Example:
@@ -186,18 +224,38 @@ message: Initial commit
 ### Show a file from a previous commit
 
 ```bash
-./minigit show 1 file.txt
+minigit show 1 file.txt
 ```
 
 This prints the version of `file.txt` stored in commit `1`.
 
-### Restore a file from a previous commit
+### Restore a single file from a previous commit
 
 ```bash
-./minigit restore 1 file.txt
+minigit restore 1 file.txt
 ```
 
-This restores `file.txt` from commit `1`.
+This restores only `file.txt` from commit `1`.
+
+### Checkout a full commit snapshot
+
+```bash
+minigit checkout 1
+```
+
+This restores all files tracked by commit `1` and updates `HEAD`.
+
+This is a simplified version of the snapshot checkout concept used by real version control systems.
+
+### Show a simple diff
+
+```bash
+minigit diff file.txt
+```
+
+This compares the staged version of `file.txt` in the index with the current working tree version.
+
+The current diff implementation is intentionally simple and compares files line by line.
 
 ## Example Workflow
 
@@ -211,6 +269,9 @@ echo "version 1" > file.txt
 ./minigit commit "First version"
 
 echo "version 2" > file.txt
+./minigit status
+./minigit diff file.txt
+
 ./minigit add file.txt
 ./minigit commit "Second version"
 
@@ -220,12 +281,21 @@ echo "version 2" > file.txt
 
 ./minigit restore 1 file.txt
 cat file.txt
+
+./minigit checkout 2
+cat file.txt
 ```
 
-Expected final output:
+Expected output after restoring commit `1`:
 
 ```text
 version 1
+```
+
+Expected output after checking out commit `2`:
+
+```text
+version 2
 ```
 
 ## How It Works
@@ -244,7 +314,7 @@ For example:
 file.txt -> 249889038256978411 -> .minigit/objects/249889038256978411.obj
 ```
 
-A commit does not store the full file directly.
+A commit does not store the full file directly.  
 It stores the filename and the hash of the object representing that version.
 
 This makes it possible to retrieve older versions later.
@@ -261,7 +331,14 @@ The `status` command compares these states to detect:
 
 - staged changes
 - unstaged changes
+- deleted files
 - clean working trees
+
+The `checkout` command restores a full tracked snapshot from a selected commit.
+
+The `restore` command restores a single file from a selected commit.
+
+The `diff` command compares the indexed version of a file with the current working tree version.
 
 ## Important Limitations
 
@@ -271,24 +348,26 @@ It does **not** currently support:
 
 - branches
 - merge
-- diff
 - recursive directory tracking
 - file names containing spaces
 - cryptographic hashing
 - remote repositories
 - push / pull
-- deleting tracked files from commits
-- full project checkout
+- deleting files from older snapshots automatically during checkout
 - partial staging
+- advanced diff algorithms
+- commit parent chains or DAG history
 
 ## Educational Notes
 
 The hash function used in this project is based on `djb2`.
 
-It is useful for learning, but it is not secure.
+It is useful for learning, but it is not secure.  
 Real Git historically used SHA-1 and also supports SHA-256 in newer repositories.
+
+MiniGit is designed to expose the internal ideas behind version control systems in a simple and readable way.
 
 ## License
 
-This project is released for educational purposes.
+This project is released for educational purposes.  
 You can use, modify, and share it freely.

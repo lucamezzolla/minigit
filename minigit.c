@@ -1,5 +1,5 @@
 /*
- * MiniGit - A tiny educational version control system written in C.
+ * MiniGit - A tiny educational content-addressed version control system written in C.
  *
  * This project is intentionally simple and is meant for learning:
  * - command-line parsing
@@ -7,10 +7,15 @@
  * - directory management
  * - content hashing
  * - object storage
+ * - staging area
  * - commit metadata
- * - restoring file versions
+ * - status inspection
+ * - restoring older file versions
+ * - checking out snapshots
+ * - simple line-by-line diff
  *
  * It is NOT a replacement for Git.
+ * This version is primarily designed for Linux/POSIX environments.
  */
 
 #include <errno.h>
@@ -38,22 +43,36 @@ typedef enum {
     INDEX_UPDATED = 2
 } IndexResult;
 
-/* CLI / repository lifecycle */
+/* --------------------------------------------------------------------------
+ * CLI / repository lifecycle
+ * -------------------------------------------------------------------------- */
+
 static void print_usage(void);
 static int require_repository(void);
 static int create_directory_if_missing(const char *path);
 static int init_repository(void);
 
-/* File hashing and object storage */
+/* --------------------------------------------------------------------------
+ * File hashing and object storage
+ * -------------------------------------------------------------------------- */
+
 static unsigned long calculate_file_hash(const char *filename);
 static int copy_file(const char *source_path, const char *destination_path);
 static int save_file_object(const char *filename, unsigned long hash);
 
-/* Index / staging area */
-static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash);
-static int add_file(const char *filename);
+/* --------------------------------------------------------------------------
+ * Index / staging area
+ * -------------------------------------------------------------------------- */
 
-/* Commit handling */
+static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash);
+static int remove_index_entry(const char *filename);
+static int add_file(const char *filename);
+static int rm_file(const char *filename);
+
+/* --------------------------------------------------------------------------
+ * Commit handling
+ * -------------------------------------------------------------------------- */
+
 static int get_current_head(void);
 static int get_next_commit_id(void);
 static int update_head(int commit_id);
@@ -63,33 +82,55 @@ static int index_matches_commit(int commit_id);
 static int create_commit(const char *message);
 static void show_log(void);
 
-/* Status */
+/* --------------------------------------------------------------------------
+ * Status
+ * -------------------------------------------------------------------------- */
+
 static void show_working_tree_changes(int *changes_count);
 static void show_staged_changes(int *staged_count);
 static void show_status(void);
 
-/* Read / restore old versions */
+/* --------------------------------------------------------------------------
+ * Read / restore / checkout old versions
+ * -------------------------------------------------------------------------- */
+
 static void show_file_from_commit(int commit_id, const char *filename);
 static int restore_file_from_commit(int commit_id, const char *filename);
+static int checkout_commit(int commit_id);
 
-/* CLI / repository lifecycle */
+/* --------------------------------------------------------------------------
+ * Diff
+ * -------------------------------------------------------------------------- */
+
+static void diff_file(const char *filename);
+
+/* --------------------------------------------------------------------------
+ * CLI / repository lifecycle implementation
+ * -------------------------------------------------------------------------- */
 
 static void print_usage(void) {
     printf("MiniGit - educational version control in C\n\n");
     printf("Usage:\n");
-    printf("  ./minigit init\n");
-    printf("  ./minigit add <file>\n");
-    printf("  ./minigit status\n");
-    printf("  ./minigit commit <message>\n");
-    printf("  ./minigit log\n");
-    printf("  ./minigit show <commit_id> <file>\n");
-    printf("  ./minigit restore <commit_id> <file>\n\n");
+    printf("  minigit init\n");
+    printf("  minigit add <file>\n");
+    printf("  minigit rm <file>\n");
+    printf("  minigit status\n");
+    printf("  minigit commit <message>\n");
+    printf("  minigit log\n");
+    printf("  minigit show <commit_id> <file>\n");
+    printf("  minigit restore <commit_id> <file>\n");
+    printf("  minigit checkout <commit_id>\n");
+    printf("  minigit diff <file>\n\n");
+
     printf("Examples:\n");
-    printf("  ./minigit init\n");
-    printf("  ./minigit add main.c\n");
-    printf("  ./minigit commit \"Initial commit\"\n");
-    printf("  ./minigit show 1 main.c\n");
-    printf("  ./minigit restore 1 main.c\n");
+    printf("  minigit init\n");
+    printf("  minigit add main.c\n");
+    printf("  minigit commit \"Initial commit\"\n");
+    printf("  minigit status\n");
+    printf("  minigit show 1 main.c\n");
+    printf("  minigit restore 1 main.c\n");
+    printf("  minigit checkout 1\n");
+    printf("  minigit diff main.c\n");
 }
 
 static int require_repository(void) {
@@ -97,7 +138,7 @@ static int require_repository(void) {
         access(OBJECTS_DIR, F_OK) != 0 ||
         access(COMMITS_DIR, F_OK) != 0 ||
         access(HEAD_FILE, F_OK) != 0) {
-        fprintf(stderr, "Error: not a MiniGit repository. Run './minigit init' first.\n");
+        fprintf(stderr, "Error: not a MiniGit repository. Run 'minigit init' first.\n");
         return 0;
     }
 
@@ -143,7 +184,9 @@ static int init_repository(void) {
     return 1;
 }
 
-/* File hashing and object storage */
+/* --------------------------------------------------------------------------
+ * File hashing and object storage implementation
+ * -------------------------------------------------------------------------- */
 
 /*
  * Educational hash function based on djb2.
@@ -212,7 +255,9 @@ static int save_file_object(const char *filename, unsigned long hash) {
     return copy_file(filename, object_path);
 }
 
-/* Index / staging area */
+/* --------------------------------------------------------------------------
+ * Index / staging area implementation
+ * -------------------------------------------------------------------------- */
 
 static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash) {
     FILE *index = fopen(INDEX_FILE, "r");
@@ -259,6 +304,43 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
     return found ? INDEX_UPDATED : INDEX_ADDED;
 }
 
+static int remove_index_entry(const char *filename) {
+    FILE *index = fopen(INDEX_FILE, "r");
+
+    if (index == NULL) {
+        return 0;
+    }
+
+    FILE *temporary_index = fopen(TEMP_INDEX_FILE, "w");
+
+    if (temporary_index == NULL) {
+        fclose(index);
+        return 0;
+    }
+
+    char indexed_filename[MAX_FILENAME_LEN];
+    unsigned long hash;
+    int removed = 0;
+
+    while (fscanf(index, "%255s %lu", indexed_filename, &hash) == 2) {
+        if (strcmp(indexed_filename, filename) == 0) {
+            removed = 1;
+        } else {
+            fprintf(temporary_index, "%s %lu\n", indexed_filename, hash);
+        }
+    }
+
+    fclose(index);
+    fclose(temporary_index);
+
+    if (rename(TEMP_INDEX_FILE, INDEX_FILE) != 0) {
+        fprintf(stderr, "Error: failed to update index file.\n");
+        return 0;
+    }
+
+    return removed;
+}
+
 static int add_file(const char *filename) {
     if (access(filename, F_OK) != 0) {
         fprintf(stderr, "Error: file '%s' does not exist.\n", filename);
@@ -292,7 +374,26 @@ static int add_file(const char *filename) {
     return 1;
 }
 
-/* Commit handling */
+static int rm_file(const char *filename) {
+    if (!remove_index_entry(filename)) {
+        fprintf(stderr, "Error: file '%s' is not tracked.\n", filename);
+        return 0;
+    }
+
+    if (access(filename, F_OK) == 0) {
+        if (remove(filename) != 0) {
+            fprintf(stderr, "Error: failed to remove '%s' from the working tree.\n", filename);
+            return 0;
+        }
+    }
+
+    printf("Removed '%s'.\n", filename);
+    return 1;
+}
+
+/* --------------------------------------------------------------------------
+ * Commit handling implementation
+ * -------------------------------------------------------------------------- */
 
 static int get_current_head(void) {
     FILE *head = fopen(HEAD_FILE, "r");
@@ -378,7 +479,6 @@ static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, uns
 
         if (sscanf(line, "- %255s %lu", snapshot_filename, &snapshot_hash) == 2 ||
             sscanf(line, "%255s %lu", snapshot_filename, &snapshot_hash) == 2) {
-
             if (strcmp(snapshot_filename, filename) == 0 && snapshot_hash == expected_hash) {
                 return 1;
             }
@@ -535,7 +635,9 @@ static void show_log(void) {
     }
 }
 
-/* Status */
+/* --------------------------------------------------------------------------
+ * Status implementation
+ * -------------------------------------------------------------------------- */
 
 static void show_working_tree_changes(int *changes_count) {
     FILE *index = fopen(INDEX_FILE, "r");
@@ -618,7 +720,9 @@ static void show_status(void) {
     }
 }
 
-/* Read / restore old versions */
+/* --------------------------------------------------------------------------
+ * Read / restore / checkout old versions implementation
+ * -------------------------------------------------------------------------- */
 
 static void show_file_from_commit(int commit_id, const char *filename) {
     unsigned long hash;
@@ -675,7 +779,144 @@ static int restore_file_from_commit(int commit_id, const char *filename) {
     return 1;
 }
 
-/* Main command dispatcher */
+static int checkout_commit(int commit_id) {
+    char commit_path[MAX_PATH_LEN];
+
+    if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
+        fprintf(stderr, "Error: commit path is too long.\n");
+        return 0;
+    }
+
+    FILE *commit = fopen(commit_path, "r");
+
+    if (commit == NULL) {
+        fprintf(stderr, "Error: commit %d was not found.\n", commit_id);
+        return 0;
+    }
+
+    char line[MAX_LINE_LEN];
+
+    while (fgets(line, sizeof(line), commit) != NULL) {
+        char filename[MAX_FILENAME_LEN];
+        unsigned long hash;
+
+        if (sscanf(line, "- %255s %lu", filename, &hash) == 2) {
+            char object_path[MAX_PATH_LEN];
+
+            if (snprintf(object_path, sizeof(object_path), "%s/%lu.obj", OBJECTS_DIR, hash) >= (int)sizeof(object_path)) {
+                fclose(commit);
+                fprintf(stderr, "Error: object path is too long.\n");
+                return 0;
+            }
+
+            if (!copy_file(object_path, filename)) {
+                fclose(commit);
+                fprintf(stderr, "Error: failed to checkout '%s'.\n", filename);
+                return 0;
+            }
+
+            update_or_add_index_entry(filename, hash);
+        }
+    }
+
+    fclose(commit);
+
+    if (!update_head(commit_id)) {
+        fprintf(stderr, "Error: failed to update HEAD.\n");
+        return 0;
+    }
+
+    printf("Checked out commit %d.\n", commit_id);
+    return 1;
+}
+
+/* --------------------------------------------------------------------------
+ * Diff implementation
+ * -------------------------------------------------------------------------- */
+
+static void diff_file(const char *filename) {
+    FILE *index = fopen(INDEX_FILE, "r");
+
+    if (index == NULL) {
+        fprintf(stderr, "Error: no index found.\n");
+        return;
+    }
+
+    char indexed_filename[MAX_FILENAME_LEN];
+    unsigned long index_hash;
+    int found = 0;
+
+    while (fscanf(index, "%255s %lu", indexed_filename, &index_hash) == 2) {
+        if (strcmp(indexed_filename, filename) == 0) {
+            found = 1;
+            break;
+        }
+    }
+
+    fclose(index);
+
+    if (!found) {
+        fprintf(stderr, "Error: file '%s' is not staged.\n", filename);
+        return;
+    }
+
+    char object_path[MAX_PATH_LEN];
+
+    if (snprintf(object_path, sizeof(object_path), "%s/%lu.obj", OBJECTS_DIR, index_hash) >= (int)sizeof(object_path)) {
+        fprintf(stderr, "Error: object path is too long.\n");
+        return;
+    }
+
+    FILE *snapshot = fopen(object_path, "r");
+    FILE *working = fopen(filename, "r");
+
+    if (snapshot == NULL) {
+        fprintf(stderr, "Error: index object for '%s' was not found.\n", filename);
+        return;
+    }
+
+    if (working == NULL) {
+        fclose(snapshot);
+        fprintf(stderr, "Error: cannot open working file '%s'.\n", filename);
+        return;
+    }
+
+    char snapshot_line[MAX_LINE_LEN];
+    char working_line[MAX_LINE_LEN];
+    int line_number = 1;
+    int differences = 0;
+
+    while (1) {
+        char *snapshot_result = fgets(snapshot_line, sizeof(snapshot_line), snapshot);
+        char *working_result = fgets(working_line, sizeof(working_line), working);
+
+        if (snapshot_result == NULL && working_result == NULL) {
+            break;
+        }
+
+        if (snapshot_result == NULL || working_result == NULL ||
+            strcmp(snapshot_line, working_line) != 0) {
+            printf("Line %d differs:\n", line_number);
+            printf("  INDEX : %s", snapshot_result ? snapshot_line : "(no line)\n");
+            printf("  WORK  : %s", working_result ? working_line : "(no line)\n");
+            printf("\n");
+            differences++;
+        }
+
+        line_number++;
+    }
+
+    fclose(snapshot);
+    fclose(working);
+
+    if (differences == 0) {
+        printf("No differences found.\n");
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Main command dispatcher
+ * -------------------------------------------------------------------------- */
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -695,11 +936,20 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "add") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: ./minigit add <file>\n");
+            fprintf(stderr, "Usage: minigit add <file>\n");
             return EXIT_FAILURE;
         }
 
         return add_file(argv[2]) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    if (strcmp(argv[1], "rm") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: minigit rm <file>\n");
+            return EXIT_FAILURE;
+        }
+
+        return rm_file(argv[2]) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (strcmp(argv[1], "status") == 0) {
@@ -709,7 +959,7 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "commit") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: ./minigit commit <message>\n");
+            fprintf(stderr, "Usage: minigit commit <message>\n");
             return EXIT_FAILURE;
         }
 
@@ -723,7 +973,7 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "show") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: ./minigit show <commit_id> <file>\n");
+            fprintf(stderr, "Usage: minigit show <commit_id> <file>\n");
             return EXIT_FAILURE;
         }
 
@@ -740,7 +990,7 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "restore") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: ./minigit restore <commit_id> <file>\n");
+            fprintf(stderr, "Usage: minigit restore <commit_id> <file>\n");
             return EXIT_FAILURE;
         }
 
@@ -752,6 +1002,32 @@ int main(int argc, char *argv[]) {
         }
 
         return restore_file_from_commit(commit_id, argv[3]) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    if (strcmp(argv[1], "checkout") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: minigit checkout <commit_id>\n");
+            return EXIT_FAILURE;
+        }
+
+        int commit_id = atoi(argv[2]);
+
+        if (commit_id <= 0) {
+            fprintf(stderr, "Error: invalid commit id.\n");
+            return EXIT_FAILURE;
+        }
+
+        return checkout_commit(commit_id) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    if (strcmp(argv[1], "diff") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: minigit diff <file>\n");
+            return EXIT_FAILURE;
+        }
+
+        diff_file(argv[2]);
+        return EXIT_SUCCESS;
     }
 
     fprintf(stderr, "Error: unknown command '%s'.\n\n", argv[1]);
