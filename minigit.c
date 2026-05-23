@@ -43,6 +43,12 @@ typedef enum {
     INDEX_UPDATED = 2
 } IndexResult;
 
+typedef enum {
+    ENTRY_INVALID = 0,
+    ENTRY_TRACK = 1,
+    ENTRY_DELETE = 2
+} EntryType;
+
 /* CLI / repository lifecycle */
 static void print_usage(void);
 static int require_repository(void);
@@ -53,6 +59,11 @@ static int init_repository(void);
 static unsigned long calculate_file_hash(const char *filename);
 static int copy_file(const char *source_path, const char *destination_path);
 static int save_file_object(const char *filename, unsigned long hash);
+
+/* Entry parsing / formatting */
+static EntryType parse_entry_line(const char *line, char *filename, unsigned long *hash);
+static void write_track_entry(FILE *file, const char *filename, unsigned long hash);
+static void write_delete_entry(FILE *file, const char *filename);
 
 /* Index / staging area */
 static IndexResult update_or_add_index_entry(const char *filename, unsigned long new_hash);
@@ -74,6 +85,11 @@ static void show_log(void);
 static void show_working_tree_changes(int *changes_count);
 static void show_staged_changes(int *staged_count);
 static void show_status(void);
+
+/* Snapshot / checkout helpers */
+static int file_is_tracked_in_commit(int commit_id, const char *filename);
+static int cleanup_tracked_files_not_in_commit(int commit_id);
+static int rewrite_index_from_commit(int commit_id);
 
 /* Read / restore / checkout old versions */
 static void show_file_from_commit(int commit_id, const char *filename);
@@ -163,10 +179,6 @@ static int init_repository(void) {
 
 /* File hashing and object storage */
 
-/*
- * Educational hash function based on djb2.
- * This is simple and fast, but it is NOT cryptographically secure.
- */
 static unsigned long calculate_file_hash(const char *filename) {
     FILE *file = fopen(filename, "rb");
 
@@ -211,7 +223,6 @@ static int copy_file(const char *source_path, const char *destination_path) {
 
     fclose(source);
     fclose(destination);
-
     return 1;
 }
 
@@ -228,6 +239,48 @@ static int save_file_object(const char *filename, unsigned long hash) {
     }
 
     return copy_file(filename, object_path);
+}
+
+/* Entry parsing / formatting */
+
+static EntryType parse_entry_line(const char *line, char *filename, unsigned long *hash) {
+    char legacy_filename[MAX_FILENAME_LEN];
+    unsigned long legacy_hash;
+
+    if (sscanf(line, "TRACK %255s %lu", filename, hash) == 2) {
+        return ENTRY_TRACK;
+    }
+
+    if (sscanf(line, "DELETE %255s", filename) == 1) {
+        return ENTRY_DELETE;
+    }
+
+    /*
+     * Backward compatibility with older MiniGit files:
+     * index line:  file.txt 12345
+     * commit line: - file.txt 12345
+     */
+    if (sscanf(line, "- %255s %lu", legacy_filename, &legacy_hash) == 2) {
+        strcpy(filename, legacy_filename);
+        *hash = legacy_hash;
+        return ENTRY_TRACK;
+    }
+
+    if (sscanf(line, "%255s %lu", legacy_filename, &legacy_hash) == 2) {
+        strcpy(filename, legacy_filename);
+        *hash = legacy_hash;
+        return ENTRY_TRACK;
+    }
+
+    return ENTRY_INVALID;
+}
+
+static void write_track_entry(FILE *file, const char *filename, unsigned long hash) {
+    fprintf(file, "TRACK %s %lu\n", filename, hash);
+}
+
+static void write_delete_entry(FILE *file, const char *filename) {
+    fprintf(file, "DELETE %s\n", filename);
 }
 
 /* Index / staging area */
@@ -251,30 +304,21 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
 
     if (index != NULL) {
         while (fgets(line, sizeof(line), index) != NULL) {
-            char indexed_filename[MAX_FILENAME_LEN];
-            unsigned long indexed_hash;
+            char current_filename[MAX_FILENAME_LEN];
+            unsigned long current_hash;
+            EntryType type = parse_entry_line(line, current_filename, &current_hash);
 
-            if (strncmp(line, "DELETE ", 7) == 0) {
-                char deleted_filename[MAX_FILENAME_LEN];
-
-                if (sscanf(line, "DELETE %255s", deleted_filename) == 1 &&
-                    strcmp(deleted_filename, filename) == 0) {
-                    fprintf(temporary_index, "%s %lu\n", filename, new_hash);
-                    found = 1;
-                } else {
-                    fputs(line, temporary_index);
-                }
-
+            if (type == ENTRY_INVALID) {
                 continue;
             }
 
-            if (sscanf(line, "%255s %lu", indexed_filename, &indexed_hash) == 2) {
-                if (strcmp(indexed_filename, filename) == 0) {
-                    fprintf(temporary_index, "%s %lu\n", filename, new_hash);
-                    found = 1;
-                } else {
-                    fprintf(temporary_index, "%s %lu\n", indexed_filename, indexed_hash);
-                }
+            if (strcmp(current_filename, filename) == 0) {
+                write_track_entry(temporary_index, filename, new_hash);
+                found = 1;
+            } else if (type == ENTRY_TRACK) {
+                write_track_entry(temporary_index, current_filename, current_hash);
+            } else if (type == ENTRY_DELETE) {
+                write_delete_entry(temporary_index, current_filename);
             }
         }
 
@@ -282,7 +326,7 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
     }
 
     if (!found) {
-        fprintf(temporary_index, "%s %lu\n", filename, new_hash);
+        write_track_entry(temporary_index, filename, new_hash);
     }
 
     fclose(temporary_index);
@@ -309,36 +353,25 @@ static int stage_delete_index_entry(const char *filename) {
     }
 
     int tracked = 0;
-    int already_deleted = 0;
     char line[MAX_LINE_LEN];
 
     if (index != NULL) {
         while (fgets(line, sizeof(line), index) != NULL) {
-            char indexed_filename[MAX_FILENAME_LEN];
-            unsigned long hash;
+            char current_filename[MAX_FILENAME_LEN];
+            unsigned long current_hash;
+            EntryType type = parse_entry_line(line, current_filename, &current_hash);
 
-            if (strncmp(line, "DELETE ", 7) == 0) {
-                char deleted_filename[MAX_FILENAME_LEN];
-
-                if (sscanf(line, "DELETE %255s", deleted_filename) == 1 &&
-                    strcmp(deleted_filename, filename) == 0) {
-                    already_deleted = 1;
-                    tracked = 1;
-                    fputs(line, temporary_index);
-                } else {
-                    fputs(line, temporary_index);
-                }
-
+            if (type == ENTRY_INVALID) {
                 continue;
             }
 
-            if (sscanf(line, "%255s %lu", indexed_filename, &hash) == 2) {
-                if (strcmp(indexed_filename, filename) == 0) {
-                    tracked = 1;
-                    fprintf(temporary_index, "DELETE %s\n", filename);
-                } else {
-                    fprintf(temporary_index, "%s %lu\n", indexed_filename, hash);
-                }
+            if (strcmp(current_filename, filename) == 0) {
+                tracked = 1;
+                write_delete_entry(temporary_index, filename);
+            } else if (type == ENTRY_TRACK) {
+                write_track_entry(temporary_index, current_filename, current_hash);
+            } else if (type == ENTRY_DELETE) {
+                write_delete_entry(temporary_index, current_filename);
             }
         }
 
@@ -347,7 +380,7 @@ static int stage_delete_index_entry(const char *filename) {
 
     fclose(temporary_index);
 
-    if (!tracked && !already_deleted) {
+    if (!tracked) {
         remove(TEMP_INDEX_FILE);
         return 0;
     }
@@ -449,7 +482,6 @@ static int update_head(int commit_id) {
 
     fprintf(head, "%d\n", commit_id);
     fclose(head);
-
     return 1;
 }
 
@@ -469,15 +501,14 @@ static int find_file_hash_in_commit(int commit_id, const char *filename, unsigne
     char line[MAX_LINE_LEN];
 
     while (fgets(line, sizeof(line), commit) != NULL) {
-        char indexed_filename[MAX_FILENAME_LEN];
-        unsigned long hash;
+        char current_filename[MAX_FILENAME_LEN];
+        unsigned long current_hash;
+        EntryType type = parse_entry_line(line, current_filename, &current_hash);
 
-        if (sscanf(line, "- %255s %lu", indexed_filename, &hash) == 2) {
-            if (strcmp(indexed_filename, filename) == 0) {
-                *found_hash = hash;
-                fclose(commit);
-                return 1;
-            }
+        if (type == ENTRY_TRACK && strcmp(current_filename, filename) == 0) {
+            *found_hash = current_hash;
+            fclose(commit);
+            return 1;
         }
     }
 
@@ -501,13 +532,13 @@ static int commit_contains_delete(int commit_id, const char *filename) {
     char line[MAX_LINE_LEN];
 
     while (fgets(line, sizeof(line), commit) != NULL) {
-        char deleted_filename[MAX_FILENAME_LEN];
+        char current_filename[MAX_FILENAME_LEN];
+        unsigned long hash;
+        EntryType type = parse_entry_line(line, current_filename, &hash);
 
-        if (sscanf(line, "DELETE %255s", deleted_filename) == 1) {
-            if (strcmp(deleted_filename, filename) == 0) {
-                fclose(commit);
-                return 1;
-            }
+        if (type == ENTRY_DELETE && strcmp(current_filename, filename) == 0) {
+            fclose(commit);
+            return 1;
         }
     }
 
@@ -528,8 +559,13 @@ static int index_matches_commit(int commit_id) {
     while (fgets(line, sizeof(line), index) != NULL) {
         char filename[MAX_FILENAME_LEN];
         unsigned long index_hash;
+        EntryType type = parse_entry_line(line, filename, &index_hash);
 
-        if (sscanf(line, "DELETE %255s", filename) == 1) {
+        if (type == ENTRY_INVALID) {
+            continue;
+        }
+
+        if (type == ENTRY_DELETE) {
             if (!commit_contains_delete(commit_id, filename)) {
                 fclose(index);
                 return 0;
@@ -539,7 +575,7 @@ static int index_matches_commit(int commit_id) {
             continue;
         }
 
-        if (sscanf(line, "%255s %lu", filename, &index_hash) == 2) {
+        if (type == ENTRY_TRACK) {
             unsigned long commit_hash;
 
             if (!find_file_hash_in_commit(commit_id, filename, &commit_hash)) {
@@ -612,15 +648,13 @@ static int create_commit(const char *message) {
     while (fgets(line, sizeof(line), index) != NULL) {
         char filename[MAX_FILENAME_LEN];
         unsigned long hash;
+        EntryType type = parse_entry_line(line, filename, &hash);
 
-        if (sscanf(line, "DELETE %255s", filename) == 1) {
-            fprintf(commit, "DELETE %s\n", filename);
+        if (type == ENTRY_DELETE) {
+            write_delete_entry(commit, filename);
             file_count++;
-            continue;
-        }
-
-        if (sscanf(line, "%255s %lu", filename, &hash) == 2) {
-            fprintf(commit, "- %s %lu\n", filename, hash);
+        } else if (type == ENTRY_TRACK) {
+            write_track_entry(commit, filename, hash);
             file_count++;
         }
     }
@@ -696,12 +730,9 @@ static void show_working_tree_changes(int *changes_count) {
     while (fgets(line, sizeof(line), index) != NULL) {
         char filename[MAX_FILENAME_LEN];
         unsigned long index_hash;
+        EntryType type = parse_entry_line(line, filename, &index_hash);
 
-        if (sscanf(line, "DELETE %255s", filename) == 1) {
-            continue;
-        }
-
-        if (sscanf(line, "%255s %lu", filename, &index_hash) != 2) {
+        if (type != ENTRY_TRACK) {
             continue;
         }
 
@@ -741,8 +772,13 @@ static void show_staged_changes(int *staged_count) {
     while (fgets(line, sizeof(line), index) != NULL) {
         char filename[MAX_FILENAME_LEN];
         unsigned long index_hash;
+        EntryType type = parse_entry_line(line, filename, &index_hash);
 
-        if (sscanf(line, "DELETE %255s", filename) == 1) {
+        if (type == ENTRY_INVALID) {
+            continue;
+        }
+
+        if (type == ENTRY_DELETE) {
             if (*staged_count == 0) {
                 printf("Changes staged for commit:\n");
             }
@@ -752,26 +788,24 @@ static void show_staged_changes(int *staged_count) {
             continue;
         }
 
-        if (sscanf(line, "%255s %lu", filename, &index_hash) != 2) {
-            continue;
-        }
+        if (type == ENTRY_TRACK) {
+            unsigned long commit_hash;
 
-        unsigned long commit_hash;
+            if (current_head <= 0 || !find_file_hash_in_commit(current_head, filename, &commit_hash)) {
+                if (*staged_count == 0) {
+                    printf("Changes staged for commit:\n");
+                }
 
-        if (current_head <= 0 || !find_file_hash_in_commit(current_head, filename, &commit_hash)) {
-            if (*staged_count == 0) {
-                printf("Changes staged for commit:\n");
+                printf("  new file: %s\n", filename);
+                (*staged_count)++;
+            } else if (index_hash != commit_hash) {
+                if (*staged_count == 0) {
+                    printf("Changes staged for commit:\n");
+                }
+
+                printf("  modified: %s\n", filename);
+                (*staged_count)++;
             }
-
-            printf("  new file: %s\n", filename);
-            (*staged_count)++;
-        } else if (index_hash != commit_hash) {
-            if (*staged_count == 0) {
-                printf("Changes staged for commit:\n");
-            }
-
-            printf("  modified: %s\n", filename);
-            (*staged_count)++;
         }
     }
 
@@ -788,6 +822,75 @@ static void show_status(void) {
     if (staged_count == 0 && changes_count == 0) {
         printf("Working tree clean.\n");
     }
+}
+
+/* Snapshot / checkout helpers */
+
+static int file_is_tracked_in_commit(int commit_id, const char *filename) {
+    unsigned long hash;
+    return find_file_hash_in_commit(commit_id, filename, &hash);
+}
+
+static int cleanup_tracked_files_not_in_commit(int commit_id) {
+    FILE *index = fopen(INDEX_FILE, "r");
+
+    if (index == NULL) {
+        return 1;
+    }
+
+    char line[MAX_LINE_LEN];
+
+    while (fgets(line, sizeof(line), index) != NULL) {
+        char filename[MAX_FILENAME_LEN];
+        unsigned long hash;
+        EntryType type = parse_entry_line(line, filename, &hash);
+
+        if (type == ENTRY_TRACK && !file_is_tracked_in_commit(commit_id, filename)) {
+            if (access(filename, F_OK) == 0 && remove(filename) != 0) {
+                fclose(index);
+                fprintf(stderr, "Error: failed to remove obsolete file '%s'.\n", filename);
+                return 0;
+            }
+        }
+    }
+
+    fclose(index);
+    return 1;
+}
+
+static int rewrite_index_from_commit(int commit_id) {
+    char commit_path[MAX_PATH_LEN];
+
+    if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
+        fprintf(stderr, "Error: commit path is too long.\n");
+        return 0;
+    }
+
+    FILE *commit = fopen(commit_path, "r");
+    FILE *index = fopen(INDEX_FILE, "w");
+
+    if (commit == NULL || index == NULL) {
+        if (commit != NULL) fclose(commit);
+        if (index != NULL) fclose(index);
+        fprintf(stderr, "Error: failed to rewrite index from commit.\n");
+        return 0;
+    }
+
+    char line[MAX_LINE_LEN];
+
+    while (fgets(line, sizeof(line), commit) != NULL) {
+        char filename[MAX_FILENAME_LEN];
+        unsigned long hash;
+        EntryType type = parse_entry_line(line, filename, &hash);
+
+        if (type == ENTRY_TRACK) {
+            write_track_entry(index, filename, hash);
+        }
+    }
+
+    fclose(commit);
+    fclose(index);
+    return 1;
 }
 
 /* Read / restore / checkout old versions */
@@ -862,22 +965,27 @@ static int checkout_commit(int commit_id) {
         return 0;
     }
 
+    if (!cleanup_tracked_files_not_in_commit(commit_id)) {
+        fclose(commit);
+        return 0;
+    }
+
     char line[MAX_LINE_LEN];
 
     while (fgets(line, sizeof(line), commit) != NULL) {
         char filename[MAX_FILENAME_LEN];
         unsigned long hash;
+        EntryType type = parse_entry_line(line, filename, &hash);
 
-        if (sscanf(line, "DELETE %255s", filename) == 1) {
+        if (type == ENTRY_DELETE) {
             if (access(filename, F_OK) == 0) {
                 remove(filename);
             }
 
-            stage_delete_index_entry(filename);
             continue;
         }
 
-        if (sscanf(line, "- %255s %lu", filename, &hash) == 2) {
+        if (type == ENTRY_TRACK) {
             char object_path[MAX_PATH_LEN];
 
             if (snprintf(object_path, sizeof(object_path), "%s/%lu.obj", OBJECTS_DIR, hash) >= (int)sizeof(object_path)) {
@@ -891,12 +999,14 @@ static int checkout_commit(int commit_id) {
                 fprintf(stderr, "Error: failed to checkout '%s'.\n", filename);
                 return 0;
             }
-
-            update_or_add_index_entry(filename, hash);
         }
     }
 
     fclose(commit);
+
+    if (!rewrite_index_from_commit(commit_id)) {
+        return 0;
+    }
 
     if (!update_head(commit_id)) {
         fprintf(stderr, "Error: failed to update HEAD.\n");
@@ -925,23 +1035,18 @@ static void diff_file(const char *filename) {
     while (fgets(line, sizeof(line), index) != NULL) {
         char indexed_filename[MAX_FILENAME_LEN];
         unsigned long hash;
+        EntryType type = parse_entry_line(line, indexed_filename, &hash);
 
-        if (sscanf(line, "DELETE %255s", indexed_filename) == 1) {
-            if (strcmp(indexed_filename, filename) == 0) {
-                staged_delete = 1;
-                found = 1;
-                break;
-            }
-
-            continue;
+        if (type == ENTRY_DELETE && strcmp(indexed_filename, filename) == 0) {
+            staged_delete = 1;
+            found = 1;
+            break;
         }
 
-        if (sscanf(line, "%255s %lu", indexed_filename, &hash) == 2) {
-            if (strcmp(indexed_filename, filename) == 0) {
-                index_hash = hash;
-                found = 1;
-                break;
-            }
+        if (type == ENTRY_TRACK && strcmp(indexed_filename, filename) == 0) {
+            index_hash = hash;
+            found = 1;
+            break;
         }
     }
 

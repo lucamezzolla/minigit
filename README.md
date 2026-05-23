@@ -32,11 +32,13 @@ MiniGit currently supports:
 - saving file contents as objects
 - creating commits
 - tracking deleted files inside commits
+- explicit index and commit entry formats using `TRACK` and `DELETE`
 - Git-like staged and unstaged change detection
 - viewing the commit log
 - showing a file from a previous commit
-- restoring a file from a previous commit
+- restoring a single file from a previous commit
 - checking out repository snapshots
+- checkout cleanup for files tracked by previous snapshots
 - simple line-by-line diff inspection
 - repository validation before command execution
 - prevention of empty commits when no changes are staged
@@ -77,15 +79,13 @@ Example:
 
 ## index
 
-Stores the staged files and their hashes.
-
-The index can also contain staged deletions.
+Stores the staged files and staged deletions.
 
 Example:
 
 ```text
-main.c 123456789
-README.md 987654321
+TRACK main.c 123456789
+TRACK README.md 987654321
 DELETE old.txt
 ```
 
@@ -105,7 +105,7 @@ Example:
 
 ## commits/
 
-Stores commit metadata.
+Stores commit metadata and snapshot entries.
 
 Example:
 
@@ -119,12 +119,7 @@ Commit file example:
 commit: 1
 message: Initial commit
 files:
-- file.txt 249889038256978411
-```
-
-Deletion example:
-
-```text
+TRACK file.txt 249889038256978411
 DELETE old.txt
 ```
 
@@ -173,7 +168,7 @@ This command:
 1. checks if the file exists
 2. calculates its hash
 3. stores the file content inside `.minigit/objects/`
-4. updates the staging index
+4. stages the file using a `TRACK` entry inside the index
 
 ---
 
@@ -186,7 +181,7 @@ minigit rm file.txt
 This command:
 
 1. removes the file from the working tree
-2. stages the deletion inside the index
+2. stages the deletion using a `DELETE` entry inside the index
 3. allows the deletion to be committed later
 
 ---
@@ -222,8 +217,6 @@ Working tree clean.
 minigit commit "Initial commit"
 ```
 
-This creates a new commit snapshot.
-
 If the index already matches the latest commit:
 
 ```text
@@ -256,13 +249,17 @@ message: Initial commit
 minigit show 1 file.txt
 ```
 
+This prints the version of `file.txt` stored in commit `1`.
+
 ---
 
-## Restore a file from a previous commit
+## Restore a single file from a previous commit
 
 ```bash
 minigit restore 1 file.txt
 ```
+
+This restores only `file.txt` from commit `1`.
 
 ---
 
@@ -272,7 +269,9 @@ minigit restore 1 file.txt
 minigit checkout 1
 ```
 
-This restores all tracked files from commit 1.
+This restores all files tracked by commit `1`, updates `HEAD`, and rewrites the index to match that commit.
+
+MiniGit also removes files that were tracked in the current index but are not present in the selected commit.
 
 ---
 
@@ -306,19 +305,14 @@ gcc -Wall -Wextra -pedantic -std=c11 minigit.c -o minigit
 minigit init
 
 echo "version 1" > file.txt
-
 minigit add file.txt
-
 minigit commit "First version"
 
 echo "version 2" >> file.txt
-
 minigit status
-
 minigit diff file.txt
 
 minigit add file.txt
-
 minigit commit "Second version"
 
 minigit log
@@ -364,13 +358,12 @@ For example:
 file.txt -> 249889038256978411 -> .minigit/objects/249889038256978411.obj
 ```
 
-A commit stores:
+The index and commit files use explicit entries:
 
-- filenames
-- hashes
-- deletion markers
-
-representing the repository snapshot.
+```text
+TRACK filename hash
+DELETE filename
+```
 
 MiniGit internally manages three states:
 
@@ -386,6 +379,8 @@ The status command compares these states to detect:
 - unstaged changes
 - staged deletions
 - clean working trees
+
+The checkout command restores a selected commit snapshot and rewrites the index to match it.
 
 ---
 
@@ -404,7 +399,8 @@ It does not currently support:
 - push / pull
 - partial staging
 - binary diff visualization
-- full repository cleanup during checkout
+- full untracked-file cleanup during checkout
+- commit parent chains or DAG history
 
 ---
 
