@@ -38,6 +38,7 @@ typedef enum {
 } IndexResult;
 
 static int create_directory_if_missing(const char *path);
+static int require_repository(void);
 static int init_repository(void);
 
 static unsigned long calculate_file_hash(const char *filename);
@@ -59,6 +60,8 @@ static void show_file_from_commit(int commit_id, const char *filename);
 static int restore_file_from_commit(int commit_id, const char *filename);
 
 static void print_usage(void);
+static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash);
+static int index_matches_commit(int commit_id);
 
 static int create_directory_if_missing(const char *path) {
     if (mkdir(path, 0700) == 0) {
@@ -70,6 +73,19 @@ static int create_directory_if_missing(const char *path) {
     }
 
     return 0;
+}
+
+static int require_repository(void) {
+    if (access(MINIGIT_DIR, F_OK) != 0 ||
+        access(OBJECTS_DIR, F_OK) != 0 ||
+        access(COMMITS_DIR, F_OK) != 0 ||
+        access(HEAD_FILE, F_OK) != 0) {
+
+        fprintf(stderr, "Error: not a MiniGit repository. Run './minigit init' first.\n");
+        return 0;
+    }
+
+    return 1;
 }
 
 static int init_repository(void) {
@@ -212,10 +228,6 @@ static IndexResult update_or_add_index_entry(const char *filename, unsigned long
 }
 
 static int add_file(const char *filename) {
-    if (access(MINIGIT_DIR, F_OK) != 0) {
-        fprintf(stderr, "Error: not a MiniGit repository. Run './minigit init' first.\n");
-        return 0;
-    }
 
     if (access(filename, F_OK) != 0) {
         fprintf(stderr, "Error: file '%s' does not exist.\n", filename);
@@ -321,6 +333,13 @@ static int create_commit(const char *message) {
         fprintf(stderr, "Error: no index found. Add files before committing.\n");
         return 0;
     }
+    
+    int current_head = get_current_head();
+
+	if (current_head > 0 && index_matches_commit(current_head)) {
+    	printf("Nothing to commit.\n");
+    	return 1;
+	}
 
     int commit_id = get_next_commit_id();
 
@@ -525,10 +544,73 @@ static void print_usage(void) {
     printf("  ./minigit restore 1 main.c\n");
 }
 
+static int snapshot_contains_file_hash(FILE *snapshot, const char *filename, unsigned long expected_hash) {
+    char line[MAX_LINE_LEN];
+
+    rewind(snapshot);
+
+    while (fgets(line, sizeof(line), snapshot) != NULL) {
+        char snapshot_filename[MAX_FILENAME_LEN];
+        unsigned long snapshot_hash;
+
+        if (sscanf(line, "- %255s %lu", snapshot_filename, &snapshot_hash) == 2 ||
+            sscanf(line, "%255s %lu", snapshot_filename, &snapshot_hash) == 2) {
+
+            if (strcmp(snapshot_filename, filename) == 0 && snapshot_hash == expected_hash) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int index_matches_commit(int commit_id) {
+    char commit_path[MAX_PATH_LEN];
+
+    if (snprintf(commit_path, sizeof(commit_path), "%s/%d.txt", COMMITS_DIR, commit_id) >= (int)sizeof(commit_path)) {
+        return 0;
+    }
+
+    FILE *index = fopen(INDEX_FILE, "r");
+    FILE *commit = fopen(commit_path, "r");
+
+    if (index == NULL || commit == NULL) {
+        if (index != NULL) fclose(index);
+        if (commit != NULL) fclose(commit);
+        return 0;
+    }
+
+    char filename[MAX_FILENAME_LEN];
+    unsigned long hash;
+    int entries = 0;
+
+    while (fscanf(index, "%255s %lu", filename, &hash) == 2) {
+        if (!snapshot_contains_file_hash(commit, filename, hash)) {
+            fclose(index);
+            fclose(commit);
+            return 0;
+        }
+
+        entries++;
+    }
+
+    fclose(index);
+    fclose(commit);
+
+    return entries > 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         print_usage();
         return EXIT_FAILURE;
+    }
+    
+    if (strcmp(argv[1], "init") != 0) {
+        if (!require_repository()) {
+            return EXIT_FAILURE;
+        }
     }
 
     if (strcmp(argv[1], "init") == 0) {
